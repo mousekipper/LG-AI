@@ -1,0 +1,211 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from transformers import AutoTokenizer, AutoModel
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import numpy as np
+import pandas as pd
+
+class KoreanMessageAppropriatenessModel(nn.Module):
+    def __init__(self, model_name, input_size, hidden_size, num_classes):
+        super(KoreanMessageAppropriatenessModel, self).__init__()
+       
+        # 한국어 특화 모델 로드 (KoBERT 또는 KcELECTRA)
+        if model_name == 'kobert':
+            self.backbone = AutoModel.from_pretrained('monologg/kobert')
+            self.tokenizer = AutoTokenizer.from_pretrained('monologg/kobert')
+        elif model_name == 'kcelectra':
+            self.backbone = AutoModel.from_pretrained('google/electra-small-discriminator')
+            self.tokenizer = AutoTokenizer.from_pretrained('google/electra-small-discriminator')
+        else:
+            raise ValueError("지원되지 않는 모델입니다. 'kobert' 또는 'kcelectra'를 선택하세요.")
+       
+        # 모델 파라미터 동결 (선택적)
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+       
+        # 분류기 레이어
+        self.classifier = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_size, num_classes)
+        )
+   
+    def forward(self, input_ids, attention_mask):
+        # 백본 모델에서 임베딩 추출
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.last_hidden_state[:, 0, :]  # [CLS] 토큰 사용
+       
+        # 분류
+        logits = self.classifier(pooled_output)
+        return logits
+
+class KoreanRelationshipContextAnalyzer:
+    def __init__(self, model_type='kobert'):
+        # 관계 유형과 친밀도 레벨
+        self.relationship_types = {
+            '낯선사람': 1,
+            '지인': 2,
+            '친구': 3,
+            '절친': 4,
+            '가족': 5,
+            '연인': 6
+        }
+       
+        # 메시지 부적절성 카테고리
+        self.appropriateness_categories = [
+            '매우_부적절',
+            '다소_부적절',
+            '중립',
+            '적절'
+        ]
+       
+        # GPU 설정
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        print(f"사용 중인 디바이스: {self.device}")
+       
+        # 모델 파라미터
+        self.model_type = model_type
+        self.input_size = 768  # KoBERT와 KcELECTRA의 임베딩 차원
+        self.hidden_size = 128
+        self.num_classes = len(self.appropriateness_categories)
+       
+        # 모델 및 토크나이저 초기화
+        self.model = KoreanMessageAppropriatenessModel(
+            model_name=model_type,
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_classes=self.num_classes
+        ).to(self.device)
+       
+        self.tokenizer = self.model.tokenizer
+   
+    def preprocess_text(self, text, max_length=128):
+        """텍스트 토큰화 및 전처리"""
+        encoding = self.tokenizer(
+            text,
+            return_tensors='pt',
+            max_length=max_length,
+            padding='max_length',
+            truncation=True
+        )
+        return encoding['input_ids'].to(self.device), encoding['attention_mask'].to(self.device)
+   
+    def train_model(self, texts, relationships, labels, epochs=10):
+        """모델 학습"""
+        # 레이블 인코딩
+        label_encoder = LabelEncoder()
+        encoded_labels = label_encoder.fit_transform(labels)
+       
+        # 데이터 분할
+        X_train, X_test, y_train, y_test = train_test_split(
+            texts, encoded_labels, test_size=0.2, random_state=42
+        )
+       
+        # 옵티마이저 및 손실 함수
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+       
+        # 학습 루프
+        for epoch in range(epochs):
+            self.model.train()
+            total_loss = 0
+           
+            for text, label in zip(X_train, y_train):
+                optimizer.zero_grad()
+               
+                # 텍스트 전처리
+                input_ids, attention_mask = self.preprocess_text(text)
+               
+                # 순전파
+                outputs = self.model(input_ids, attention_mask)
+                loss = criterion(outputs, torch.tensor([label]).to(self.device))
+               
+                # 역전파
+                loss.backward()
+                optimizer.step()
+               
+                total_loss += loss.item()
+           
+            print(f"에포크 {epoch+1}, 손실: {total_loss/len(X_train)}")
+   
+    def analyze_message(self, text, relationship_type):
+        """메시지 부적절성 분석"""
+        input_ids, attention_mask = self.preprocess_text(text)
+       
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(input_ids, attention_mask)
+            probabilities = torch.softmax(outputs, dim=1)
+            predicted_class = torch.argmax(probabilities, dim=1)
+       
+        return {
+            '메시지': text,
+            '관계': relationship_type,
+            '부적절성_점수': probabilities.cpu().numpy()[0],
+            '예측_카테고리': self.appropriateness_categories[predicted_class]
+        }
+
+# 데이터 로딩 함수
+def load_training_data(file_path):
+    """
+    데이터 넣는 부분 - CSV 파일에서 학습 데이터 로드
+   
+    CSV 파일 형식:
+    - 컬럼: text, relationship, appropriateness
+   
+    예시 데이터:
+    text,relationship,appropriateness
+    안녕하세요,지인,적절
+    너 바보야,친구,다소_부적절
+    사랑해,연인,적절
+    """
+    # 여기에 데이터 로딩 코드 작성
+    # 예: df = pd.read_csv(file_path)
+    # return df['text'].tolist(), df['relationship'].tolist(), df['appropriateness'].tolist()
+   
+    # 임시 샘플 데이터 (실제 사용 시 CSV 파일에서 로드)
+    texts = [
+        "안녕", "사랑해", "바보", "너무 고마워요",
+        "죽고 싶어", "관심 있어?"
+    ]
+    relationships = [
+        '친구', '연인', '친구', '가족',
+        '낯선사람', '지인'
+    ]
+    labels = [
+        '적절', '적절', '다소_부적절', '적절',
+        '매우_부적절', '다소_부적절'
+    ]
+   
+    return texts, relationships, labels
+
+# 메인 실행
+if __name__ == "__main__":
+    # 모델 초기화 (KoBERT 또는 KcELECTRA)
+    analyzer = KoreanRelationshipContextAnalyzer(model_type='kobert')
+   
+    try:
+        # 학습 데이터 로드 - 여기에 실제 CSV 파일 경로 입력
+        texts, relationships, labels = load_training_data('your_training_data.csv')
+       
+        # 모델 학습
+        analyzer.train_model(texts, relationships, labels, epochs=20)
+       
+        # 테스트 메시지 분석
+        test_messages = [
+            ("오늘 너무 예쁘다", '연인'),
+            ("안녕하세요", '지인'),
+            ("바보야", '친구')
+        ]
+       
+        for message, relationship in test_messages:
+            result = analyzer.analyze_message(message, relationship)
+            print(f"메시지: {message}")
+            print(f"관계: {relationship}")
+            print(f"분석 결과: {result}\n")
+   
+    except Exception as e:
+        print(f"오류 발생: {e}") 
